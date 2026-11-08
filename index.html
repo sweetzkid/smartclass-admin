@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SmartClass NG Admin</title>
+<style>
+  :root { --navy:#0B2A5B; --gold:#F2B705; --green:#1E9E5A; --bg:#F4F7FB; --text:#1B2430; --muted:#6B7686; --border:#DDE3EC; --err:#C0392B; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; background:var(--bg); color:var(--text); }
+  header { background:var(--navy); color:#fff; padding:14px 16px; display:flex; justify-content:space-between; align-items:center; gap:10px; }
+  header h1 { font-size:18px; margin:0; }
+  header small { color:var(--gold); display:block; font-size:12px; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  .card { background:#fff; border:1px solid var(--border); border-radius:12px; padding:14px; margin-bottom:12px; }
+  .row { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  .muted { color:var(--muted); font-size:14px; margin-top:4px; }
+  .badge { font-size:12px; font-weight:700; padding:3px 10px; border-radius:10px; color:#fff; }
+  .badge.draft { background:var(--muted); }
+  .badge.published { background:var(--green); }
+  label { display:block; font-weight:600; margin:14px 0 6px; }
+  input, select, textarea { width:100%; padding:11px 12px; border:1px solid var(--border); border-radius:10px; font-size:16px; font-family:inherit; background:#fff; color:var(--text); }
+  textarea { min-height:110px; resize:vertical; }
+  .btn { border:0; border-radius:10px; padding:11px 16px; font-size:15px; font-weight:700; color:#fff; cursor:pointer; }
+  .btn.navy { background:var(--navy); } .btn.green { background:var(--green); } .btn.gold { background:var(--gold); color:var(--navy); }
+  .btn.grey { background:#E6EAF0; color:var(--text); } .btn.red { background:var(--err); }
+  .btn:disabled { opacity:.6; }
+  .actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:12px; }
+  .filters { display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:12px; }
+  .error { color:var(--err); font-weight:600; min-height:20px; }
+  .note { background:#E8F6EE; border:1px solid var(--green); color:#14633a; padding:10px 12px; border-radius:10px; margin-bottom:12px; font-weight:600; }
+  .login { max-width:380px; margin:40px auto; }
+  footer { text-align:center; color:var(--muted); font-style:italic; font-size:13px; padding:20px; }
+  h2 { color:var(--navy); margin:6px 0 12px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<footer>SmartClass NG Admin &bull; Powered by Sir Sampson</footer>
+
+<script>
+// ---------- SETTINGS (publishable key is safe to keep here) ----------
+var SUPABASE_URL = 'https://txrpvjopirejkjdhztdd.supabase.co';
+var SUPABASE_KEY = 'sb_publishable_oXbwztUBCAi8UUEjAh6Zog_tSq2NUlp';
+var EMAIL_DOMAIN = 'smartclass.ng';
+
+var FIELDS = [
+  ['objectives', 'Learning objectives'],
+  ['explanation', 'Explanation'],
+  ['definitions', 'Definitions'],
+  ['examples', 'Examples'],
+  ['teaching_procedure', 'Teaching procedure (teachers only)'],
+  ['materials', 'Materials (teachers only)'],
+  ['exercises', 'Exercises'],
+  ['summary', 'Summary'],
+  ['revision_prompts', 'Revision prompts']
+];
+
+var app = document.getElementById('app');
+var session = null;
+var me = null;
+var classes = [];
+var subjects = [];
+var lessons = [];
+var filters = { cls: '', subject: '', term: '', status: '' };
+
+// ---------- tiny DOM helper ----------
+function h(tag, attrs) {
+  var e = document.createElement(tag);
+  var after = null;
+  attrs = attrs || {};
+  Object.keys(attrs).forEach(function (k) {
+    var v = attrs[k];
+    if (k === 'class') e.className = v;
+    else if (k.indexOf('on') === 0) e.addEventListener(k.slice(2), v);
+    else if (k === 'value') after = v;
+    else e.setAttribute(k, v);
+  });
+  function flat(a) {
+    return Array.isArray(a) ? a.reduce(function (r, x) { return r.concat(flat(x)); }, []) : [a];
+  }
+  for (var i = 2; i < arguments.length; i++) {
+    var kids = flat(arguments[i]);
+    kids.forEach(function (c) {
+      if (c === null || c === undefined || c === false) return;
+      e.appendChild(c.nodeType ? c : document.createTextNode(String(c)));
+    });
+  }
+  if (after !== null) e.value = after;
+  return e;
+}
+function show(node) { app.innerHTML = ''; app.appendChild(node); window.scrollTo(0, 0); }
+
+// ---------- API ----------
+function saveSession() { try { sessionStorage.setItem('sc_session', JSON.stringify(session)); } catch (e) {} }
+function clearSession() { try { sessionStorage.removeItem('sc_session'); } catch (e) {} }
+
+async function refreshSession() {
+  try {
+    var res = await fetch(SUPABASE_URL + '/auth/v1/token?grant_type=refresh_token', {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ refresh_token: session.refresh_token })
+    });
+    if (!res.ok) return false;
+    var s = await res.json();
+    session = { access_token: s.access_token, refresh_token: s.refresh_token, user: s.user };
+    saveSession();
+    return true;
+  } catch (e) { return false; }
+}
+
+async function api(path, opts, retry) {
+  opts = opts || {};
+  if (retry === undefined) retry = true;
+  var headers = Object.assign({ apikey: SUPABASE_KEY, 'Content-Type': 'application/json' }, opts.headers || {});
+  if (session) headers.Authorization = 'Bearer ' + session.access_token;
+  var res;
+  try {
+    res = await fetch(SUPABASE_URL + path, Object.assign({}, opts, { headers: headers }));
+  } catch (e) {
+    throw new Error('No internet connection.');
+  }
+  if (res.status === 401 && retry && session && session.refresh_token) {
+    if (await refreshSession()) return api(path, opts, false);
+    await signOut();
+    throw new Error('Your session expired. Please sign in again.');
+  }
+  if (!res.ok) {
+    var msg = 'Something went wrong. Please try again.';
+    try { var j = await res.json(); msg = j.message || j.msg || j.error_description || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+  if (res.status === 204) return null;
+  var text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+async function login(schoolId, password) {
+  var email = schoolId.trim().toLowerCase() + '@' + EMAIL_DOMAIN;
+  var res;
+  try {
+    res = await fetch(SUPABASE_URL + '/auth/v1/token?grant_type=password', {
+      method: 'POST',
+      headers: { apikey: SUPABASE_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ email: email, password: password })
+    });
+  } catch (e) { throw new Error('No internet connection.'); }
+  if (!res.ok) throw new Error('Incorrect school ID or password.');
+  var s = await res.json();
+  session = { access_token: s.access_token, refresh_token: s.refresh_token, user: s.user };
+  saveSession();
+  await loadMe();
+}
+
+async function loadMe() {
+  var p = await api('/rest/v1/profiles?id=eq.' + session.user.id + '&select=full_name,role,status');
+  if (!p || !p[0] || p[0].role !== 'admin' || p[0].status !== 'active') {
+    await signOut();
+    throw new Error('This is not an active administrator account.');
+  }
+  me = p[0];
+}
+
+async function signOut() {
+  try {
+    if (session) await fetch(SUPABASE_URL + '/auth/v1/logout', {
+      method: 'POST', headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + session.access_token }
+    });
+  } catch (e) {}
+  session = null; me = null; clearSession();
+}
+
+async function loadAll() {
+  var r = await Promise.all([
+    api('/rest/v1/classes?select=id,name&order=name.asc'),
+    api('/rest/v1/subjects?select=id,name&order=name.asc'),
+    api('/rest/v1/lessons?select=*,classes(name),subjects(name)&order=updated_at.desc')
+  ]);
+  classes = r[0]; subjects = r[1]; lessons = r[2];
+}
+
+// ---------- ATTACHMENTS (files, YouTube, links) ----------
+var MAX_FILE_BYTES = 50 * 1024 * 1024;
+
+function youtubeId(u) {
+  var m = String(u).match(/(?:youtu\.be\/|youtube\.com\/(?:watch\?(?:.*&)?v=|embed\/|shorts\/|live\/))([A-Za-z0-9_-]{11})/);
+  return m ? m[1] : null;
+}
+
+function formatSize(n) {
+  if (!n) return '';
+  return n > 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB';
+}
+
+async function uploadToStorage(path, file) {
+  function attempt() {
+    return fetch(SUPABASE_URL + '/storage/v1/object/lesson-files/' + path, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_KEY,
+        Authorization: 'Bearer ' + session.access_token,
+        'Content-Type': file.type || 'application/octet-stream'
+      },
+      body: file
+    });
+  }
+  var res;
+  try { res = await attempt(); } catch (e) { throw new Error('No internet connection.'); }
+  if (res.status === 401 && await refreshSession()) res = await attempt();
+  if (!res.ok) {
+    var msg = 'Upload failed. Please try again.';
+    try { var j = await res.json(); msg = j.message || j.error || msg; } catch (e) {}
+    throw new Error(msg);
+  }
+}
+
+async function deleteFromStorage(path) {
+  try {
+    await fetch(SUPABASE_URL + '/storage/v1/object/lesson-files/' + path, {
+      method: 'DELETE',
+      headers: { apikey: SUPABASE_KEY, Authorization: 'Bearer ' + session.access_token }
+    });
+  } catch (e) {}
+}
+
+function attachmentsCard(lessonId) {
+  var list = h('div', {});
+  var msg = h('p', { class: 'error' }, '');
+  var fileInput = h('input', { type: 'file', accept: 'image/*,audio/*,video/*,application/pdf' });
+  var fileTitle = h('input', { type: 'text', style: 'margin-top:8px', placeholder: 'Title (optional, defaults to the file name)' });
+  var ytUrl = h('input', { type: 'url', placeholder: 'https://www.youtube.com/watch?v=...' });
+  var ytTitle = h('input', { type: 'text', style: 'margin-top:8px', placeholder: 'Video title' });
+  var lnUrl = h('input', { type: 'url', placeholder: 'https://...' });
+  var lnTitle = h('input', { type: 'text', style: 'margin-top:8px', placeholder: 'Link title' });
+
+  function describe(r) {
+    if (r.kind === 'youtube') return 'YouTube video';
+    if (r.kind === 'link') return 'Link: ' + r.url;
+    var t = r.mime_type || '';
+    var type = t.indexOf('image/') === 0 ? 'Image' : t.indexOf('audio/') === 0 ? 'Audio' : t.indexOf('video/') === 0 ? 'Video file' : t === 'application/pdf' ? 'PDF' : 'File';
+    return type + (r.size_bytes ? ' \u2022 ' + formatSize(r.size_bytes) : '');
+  }
+
+  async function refresh() {
+    try {
+      var rows = await api('/rest/v1/lesson_resources?lesson_id=eq.' + lessonId + '&select=*&order=position.asc,created_at.asc');
+      list.innerHTML = '';
+      if (!rows.length) list.appendChild(h('div', { class: 'muted' }, 'No attachments yet.'));
+      rows.forEach(function (r) {
+        list.appendChild(h('div', { class: 'row', style: 'padding:8px 0;border-top:1px solid var(--border)' },
+          h('div', {}, h('strong', {}, r.title), h('div', { class: 'muted' }, describe(r))),
+          h('button', { class: 'btn red', onclick: async function () {
+            if (!window.confirm('Remove "' + r.title + '" from this lesson?')) return;
+            msg.textContent = '';
+            try {
+              await api('/rest/v1/lesson_resources?id=eq.' + r.id, { method: 'DELETE' });
+              if (r.kind === 'file' && r.storage_path) await deleteFromStorage(r.storage_path);
+              await refresh();
+            } catch (e) { msg.textContent = e.message; }
+          } }, 'Remove')
+        ));
+      });
+    } catch (e) {
+      msg.textContent = e.message + ' (If this keeps happening, run resources.sql in Supabase.)';
+    }
+  }
+
+  function addRow(row) {
+    return api('/rest/v1/lesson_resources', { method: 'POST', body: JSON.stringify(Object.assign({ lesson_id: lessonId }, row)) });
+  }
+
+  var upBtn = h('button', { class: 'btn navy', style: 'margin-top:10px', onclick: async function () {
+    msg.textContent = '';
+    var f = fileInput.files && fileInput.files[0];
+    if (!f) { msg.textContent = 'Choose a file first.'; return; }
+    if (f.size > MAX_FILE_BYTES) {
+      msg.textContent = 'This file is over 50 MB. For long videos, upload to YouTube and add the video link instead.';
+      return;
+    }
+    upBtn.disabled = true; upBtn.textContent = 'Uploading...';
+    var path = lessonId + '/' + Date.now() + '-' + f.name.replace(/[^A-Za-z0-9._-]/g, '_');
+    try {
+      await uploadToStorage(path, f);
+      try {
+        await addRow({ kind: 'file', title: fileTitle.value.trim() || f.name, storage_path: path, mime_type: f.type || null, size_bytes: f.size });
+      } catch (e) { await deleteFromStorage(path); throw e; }
+      fileInput.value = ''; fileTitle.value = '';
+      await refresh();
+    } catch (e) { msg.textContent = e.message; }
+    upBtn.disabled = false; upBtn.textContent = 'Upload file';
+  } }, 'Upload file');
+
+  var ytBtn = h('button', { class: 'btn navy', style: 'margin-top:10px', onclick: async function () {
+    msg.textContent = '';
+    var id = youtubeId(ytUrl.value.trim());
+    if (!id) { msg.textContent = 'That does not look like a YouTube link.'; return; }
+    try {
+      await addRow({ kind: 'youtube', title: ytTitle.value.trim() || 'YouTube video', url: 'https://www.youtube.com/watch?v=' + id });
+      ytUrl.value = ''; ytTitle.value = '';
+      await refresh();
+    } catch (e) { msg.textContent = e.message; }
+  } }, 'Add YouTube video');
+
+  var lnBtn = h('button', { class: 'btn navy', style: 'margin-top:10px', onclick: async function () {
+    msg.textContent = '';
+    var u = lnUrl.value.trim();
+    if (!/^https?:\/\//i.test(u)) { msg.textContent = 'The link must start with http:// or https://'; return; }
+    try {
+      await addRow({ kind: 'link', title: lnTitle.value.trim() || u, url: u });
+      lnUrl.value = ''; lnTitle.value = '';
+      await refresh();
+    } catch (e) { msg.textContent = e.message; }
+  } }, 'Add link');
+
+  var card = h('div', { class: 'card' },
+    h('h2', {}, 'Attachments'),
+    list,
+    msg,
+    h('label', {}, 'Upload a file (image, audio, video or PDF, up to 50 MB)'),
+    fileInput, fileTitle, upBtn,
+    h('label', {}, 'Add a YouTube video'),
+    ytUrl, ytTitle, ytBtn,
+    h('label', {}, 'Add an external link'),
+    lnUrl, lnTitle, lnBtn
+  );
+  refresh();
+  return card;
+}
+
+// ---------- SCREENS ----------
+function renderLogin(err) {
+  var id = h('input', { type: 'text', placeholder: 'e.g. ADMIN001', autocapitalize: 'characters', autocomplete: 'username' });
+  var pw = h('input', { type: 'password', placeholder: 'Password', autocomplete: 'current-password' });
+  var msg = h('p', { class: 'error' }, err || '');
+  var btn = h('button', { class: 'btn navy', type: 'submit', style: 'width:100%;margin-top:16px' }, 'Sign In');
+  var form = h('form', { class: 'card login', onsubmit: async function (e) {
+    e.preventDefault();
+    if (!id.value.trim() || !pw.value) { msg.textContent = 'Please enter your school ID and password.'; return; }
+    btn.disabled = true; btn.textContent = 'Signing in...'; msg.textContent = '';
+    try {
+      await login(id.value, pw.value);
+      await loadAll();
+      renderList();
+    } catch (ex) {
+      msg.textContent = ex.message;
+      btn.disabled = false; btn.textContent = 'Sign In';
+    }
+  } },
+    h('h2', {}, 'Administrator Sign In'),
+    h('label', {}, 'School ID'), id,
+    h('label', {}, 'Password'), pw,
+    msg, btn
+  );
+  show(form);
+}
+
+function topBar() {
+  return h('header', {},
+    h('div', {}, h('h1', {}, 'SmartClass NG Admin'), h('small', {}, me ? me.full_name : '')),
+    h('button', { class: 'btn gold', onclick: async function () { await signOut(); renderLogin(); } }, 'Sign Out')
+  );
+}
+
+function optionList(items, placeholder) {
+  return [h('option', { value: '' }, placeholder)].concat(items.map(function (i) { return h('option', { value: i.id }, i.name); }));
+}
+
+function renderList(note) {
+  var f = filters;
+  var shown = lessons.filter(function (l) {
+    return (!f.cls || l.class_id === f.cls) && (!f.subject || l.subject_id === f.subject) &&
+      (!f.term || String(l.term) === f.term) && (!f.status || l.status === f.status);
+  }).sort(function (a, b) {
+    var ka = a.classes.name + '|' + a.subjects.name + '|' + a.term + '|' + String(a.position).padStart(5, '0') + '|' + a.topic;
+    var kb = b.classes.name + '|' + b.subjects.name + '|' + b.term + '|' + String(b.position).padStart(5, '0') + '|' + b.topic;
+    return ka.localeCompare(kb);
+  });
+
+  function filterSelect(key, options) {
+    return h('select', { onchange: function (e) { filters[key] = e.target.value; renderList(); }, value: filters[key] }, options);
+  }
+
+  var root = h('div', {}, topBar(),
+    h('main', {},
+      note ? h('div', { class: 'note' }, note) : null,
+      h('div', { class: 'row', style: 'margin-bottom:12px' },
+        h('h2', { style: 'margin:0' }, 'Lessons'),
+        h('button', { class: 'btn green', onclick: function () { renderEditor(null); } }, '+ New Lesson')
+      ),
+      h('div', { class: 'filters' },
+        filterSelect('cls', optionList(classes, 'All classes')),
+        filterSelect('subject', optionList(subjects, 'All subjects')),
+        filterSelect('term', [h('option', { value: '' }, 'All terms'), h('option', { value: '1' }, 'Term 1'), h('option', { value: '2' }, 'Term 2'), h('option', { value: '3' }, 'Term 3')]),
+        filterSelect('status', [h('option', { value: '' }, 'Draft and published'), h('option', { value: 'draft' }, 'Drafts only'), h('option', { value: 'published' }, 'Published only')])
+      ),
+      shown.length === 0 ? h('div', { class: 'card' }, h('div', { class: 'muted' }, lessons.length === 0 ? 'No lessons yet. Tap "+ New Lesson" to write the first one.' : 'No lessons match these filters.')) : null,
+      shown.map(function (l) {
+        return h('div', { class: 'card' },
+          h('div', { class: 'row' }, h('strong', {}, l.topic), h('span', { class: 'badge ' + l.status }, l.status === 'published' ? 'Published' : 'Draft')),
+          h('div', { class: 'muted' }, l.classes.name + ' \u2022 ' + l.subjects.name + ' \u2022 Term ' + l.term + ' \u2022 Version ' + l.version),
+          h('div', { class: 'actions' },
+            h('button', { class: 'btn navy', onclick: function () { renderEditor(l); } }, 'Edit'),
+            l.status === 'draft'
+              ? h('button', { class: 'btn green', onclick: function () { setStatus(l, 'published'); } }, 'Publish')
+              : h('button', { class: 'btn grey', onclick: function () { setStatus(l, 'draft'); } }, 'Unpublish')
+          )
+        );
+      })
+    )
+  );
+  show(root);
+}
+
+async function setStatus(l, status) {
+  var q = status === 'published'
+    ? 'Publish "' + l.topic + '"? Students and teachers will be able to see it.'
+    : 'Unpublish "' + l.topic + '"? It will disappear from the app.';
+  if (!window.confirm(q)) return;
+  try {
+    await api('/rest/v1/lessons?id=eq.' + l.id, { method: 'PATCH', body: JSON.stringify({ status: status }) });
+    await loadAll();
+    renderList(status === 'published' ? 'Lesson published.' : 'Lesson unpublished.');
+  } catch (e) { window.alert(e.message); }
+}
+
+function renderEditor(l, note) {
+  var isNew = !l;
+  l = l || { class_id: '', subject_id: '', term: 1, position: 0, topic: '', status: 'draft' };
+  var err = h('p', { class: 'error' }, '');
+
+  var clsSel = h('select', { value: l.class_id }, optionList(classes, 'Choose class'));
+  var subSel = h('select', { value: l.subject_id }, optionList(subjects, 'Choose subject'));
+  var termSel = h('select', { value: String(l.term) }, [1, 2, 3].map(function (t) { return h('option', { value: String(t) }, 'Term ' + t); }));
+  var pos = h('input', { type: 'number', min: '0', value: String(l.position) });
+  var topic = h('input', { type: 'text', value: l.topic, placeholder: 'e.g. the topic as written in the curriculum' });
+  var areas = {};
+  FIELDS.forEach(function (f) { areas[f[0]] = h('textarea', {}, ''); areas[f[0]].value = l[f[0]] || ''; });
+
+  async function save(status) {
+    var body = {
+      class_id: clsSel.value, subject_id: subSel.value, term: parseInt(termSel.value, 10),
+      position: parseInt(pos.value, 10) || 0, topic: topic.value.trim()
+    };
+    FIELDS.forEach(function (f) { body[f[0]] = areas[f[0]].value.trim() || null; });
+    if (!body.class_id || !body.subject_id || !body.topic) { err.textContent = 'Please choose a class, a subject and enter the topic.'; return; }
+    if (status) {
+      if (!window.confirm('Publish this lesson? Students and teachers will be able to see it.')) return;
+      body.status = status;
+    }
+    err.textContent = '';
+    try {
+      if (isNew) {
+        var created = await api('/rest/v1/lessons', { method: 'POST', headers: { Prefer: 'return=representation' }, body: JSON.stringify(body) });
+        await loadAll();
+        if (!status) {
+          var row = lessons.filter(function (x) { return x.id === created[0].id; })[0];
+          renderEditor(row, 'Draft saved. You can now add audio, images, videos, PDFs and links below.');
+          return;
+        }
+      } else {
+        await api('/rest/v1/lessons?id=eq.' + l.id, { method: 'PATCH', body: JSON.stringify(body) });
+        await loadAll();
+      }
+      renderList(status === 'published' ? 'Lesson saved and published.' : 'Lesson saved.');
+    } catch (e) { err.textContent = e.message; }
+  }
+
+  var actions = [
+    h('button', { class: 'btn navy', onclick: function () { save(null); } }, isNew ? 'Save Draft' : 'Save Changes'),
+    h('button', { class: 'btn green', onclick: function () { save('published'); } }, 'Save and Publish'),
+    h('button', { class: 'btn grey', onclick: function () { renderList(); } }, 'Cancel')
+  ];
+  if (!isNew && l.status === 'draft') {
+    actions.push(h('button', { class: 'btn red', onclick: async function () {
+      if (!window.confirm('Delete this draft permanently?')) return;
+      try {
+        await api('/rest/v1/lessons?id=eq.' + l.id, { method: 'DELETE' });
+        await loadAll(); renderList('Draft deleted.');
+      } catch (e) { err.textContent = e.message; }
+    } }, 'Delete Draft'));
+  }
+
+  var root = h('div', {}, topBar(),
+    h('main', {},
+      note ? h('div', { class: 'note' }, note) : null,
+      h('h2', {}, isNew ? 'New Lesson' : 'Edit Lesson'),
+      !isNew ? h('div', { class: 'muted', style: 'margin-bottom:8px' }, 'Currently ' + l.status + ', version ' + l.version + '. Every save creates a new version in the history.') : null,
+      h('div', { class: 'card' },
+        h('label', {}, 'Class'), clsSel,
+        h('label', {}, 'Subject'), subSel,
+        h('label', {}, 'Term'), termSel,
+        h('label', {}, 'Topic order (0, 1, 2 ... as in the curriculum)'), pos,
+        h('label', {}, 'Topic'), topic,
+        FIELDS.map(function (f) { return [h('label', {}, f[1]), areas[f[0]]]; }),
+        err,
+        h('div', { class: 'actions' }, actions)
+      ),
+      isNew
+        ? h('div', { class: 'card' }, h('div', { class: 'muted' }, 'Save the draft first, then you can add audio, images, videos, PDFs and links to this lesson.'))
+        : attachmentsCard(l.id)
+    )
+  );
+  show(root);
+}
+
+// ---------- START ----------
+(async function boot() {
+  try {
+    var saved = sessionStorage.getItem('sc_session');
+    if (saved) {
+      session = JSON.parse(saved);
+      await loadMe();
+      await loadAll();
+      renderList();
+      return;
+    }
+  } catch (e) { session = null; me = null; }
+  renderLogin();
+})();
+</script>
+</body>
+</html>
